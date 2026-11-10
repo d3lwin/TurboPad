@@ -1,5 +1,7 @@
 # TurboPad
 
+*All the files in this project were 100% AI generated and I cannot guarantee full functionality of the program. Use at your own risk.*
+
 A cross-platform desktop **rapid-fire macro spammer** for a connected DualShock 4.
 TurboPad reads the controller live, lights up a full PS4 input map, and taps a
 keyboard key or mouse button while you hold (or toggle) an activation control.
