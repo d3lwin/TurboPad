@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -97,6 +100,25 @@ class PadState:
         if not self.connected:
             return False
         return self.control_value(control) >= threshold
+
+    def control_pressed(
+        self,
+        control: str,
+        was_down: bool,
+        press_threshold: float = 0.35,
+        release_threshold: float = 0.2,
+    ) -> bool:
+        """Debounce an activation control, with hysteresis for analog inputs.
+
+        Analog triggers can hover around a single threshold and emit multiple
+        press edges; using a lower release threshold keeps toggle mode stable.
+        """
+
+        if not self.connected:
+            return False
+        value = self.control_value(control)
+        threshold = release_threshold if was_down else press_threshold
+        return value >= threshold
 
     def active_controls(self, threshold: float = 0.25) -> set[str]:
         if not self.connected:
@@ -199,21 +221,85 @@ def effective_mapping(mapping: dict[str, str] | None) -> dict[str, str]:
     return merged
 
 
+def _input_device_paths(name: str) -> tuple[str, ...]:
+    """Return the /dev/input nodes of the kernel device matching ``name``.
+
+    SDL can keep reporting a removed joystick (especially when it was opened
+    through ``SDL_JOYSTICK_DEVICE`` or when a Bluetooth stack tears down
+    slowly). Watching the kernel device nodes gives us an immediate, reliable
+    disconnect signal that does not depend on SDL event delivery.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return ()
+    try:
+        with open("/proc/bus/input/devices", encoding="utf-8", errors="replace") as handle:
+            blocks = handle.read().split("\n\n")
+    except OSError:
+        return ()
+
+    wanted = name.strip().casefold()
+    if not wanted:
+        return ()
+
+    paths: list[str] = []
+    for block in blocks:
+        device_name = ""
+        handlers: list[str] = []
+        for line in block.splitlines():
+            if line.startswith("N: Name="):
+                device_name = line.partition("=")[2].strip().strip('"')
+            elif line.startswith("H: Handlers="):
+                handlers = line.partition("=")[2].split()
+        if not device_name or not handlers:
+            continue
+        actual = device_name.casefold()
+        if wanted not in actual and actual not in wanted:
+            continue
+        for handler in handlers:
+            if not handler.startswith(("js", "event")):
+                continue
+            path = f"/dev/input/{handler}"
+            if os.path.exists(path):
+                paths.append(path)
+
+    return tuple(dict.fromkeys(paths))
+
+
 class ControllerManager:
     """Polls the first available gamepad and exposes a stable PS4-style state."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_lost: Callable[[], None] | None = None) -> None:
         self._ready = False
         self._init_error = ""
         self._joy = None
         self._sdl_controller = None
         self._mapping: dict[str, str] = dict(DEFAULT_MAPPING)
+        self._bindings: dict[str, Binding | None] = {
+            name: parse_binding(spec) for name, spec in self._mapping.items()
+        }
         self._joy_name = ""
         self._instance_id: int | None = None
+        self._device_paths: tuple[str, ...] = ()
         self._last_scan = 0.0
+        self._last_probe = 0.0
+        self._read_failed = False
         self._last_state = PadState()
         self._last_connected = False
+        self._on_lost = on_lost
+        self._state_lock = threading.RLock()
+        self._lost = False
+        self._lost_name = ""
+        self._lost_until = 0.0
+        self._missing_since = 0.0
+        self._watch_stop = threading.Event()
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop,
+            name="turbopad-controller-watch",
+            daemon=True,
+        )
         self._initialise()
+        self._watch_thread.start()
 
     @property
     def initialisation_error(self) -> str:
@@ -231,6 +317,46 @@ class ControllerManager:
             self._scan(force=True)
         except Exception as exc:  # pragma: no cover - platform dependent
             self._init_error = f"Controller backend unavailable: {exc}"
+
+    @staticmethod
+    def _candidate_score(
+        candidate: object,
+        name: str,
+        guid: str,
+        preferred: tuple[str, ...],
+    ) -> int:
+        """Rank SDL joysticks so the real pad wins over a duplicate node.
+
+        SDL can expose the same controller twice when ``SDL_JOYSTICK_DEVICE``
+        is set: one real udev device and one zero-state duplicate of the
+        explicitly opened ``/dev/input/js*`` node. The duplicate has a GUID
+        with a zero bus and never reports input, so prefer a device with a
+        real bus/name and, at connect time, any device that is already active.
+        """
+
+        score = 0
+        lower = name.casefold()
+        if any(token in lower for token in preferred):
+            score += 100
+        if len(guid) >= 4:
+            try:
+                if int(guid[:4], 16) != 0:
+                    score += 50
+            except ValueError:
+                pass
+        try:
+            button_count = int(candidate.get_numbuttons())  # type: ignore[attr-defined]
+            if any(candidate.get_button(index) for index in range(button_count)):  # type: ignore[attr-defined]
+                score += 500
+            axis_count = int(candidate.get_numaxes())  # type: ignore[attr-defined]
+            if any(
+                abs(float(candidate.get_axis(index))) > 0.5  # type: ignore[attr-defined]
+                for index in range(axis_count)
+            ):
+                score += 250
+        except Exception:
+            pass
+        return score
 
     def _scan(self, force: bool = False) -> None:
         if not self._ready or pygame is None:
@@ -252,8 +378,7 @@ class ControllerManager:
         if count <= 0:
             return
 
-        chosen = None
-        chosen_name = ""
+        candidates: list[tuple[int, object, str, str]] = []
         preferred = ("dualshock", "ps4", "wireless controller", "playstation", "sony")
         for index in range(count):
             candidate = None
@@ -261,6 +386,10 @@ class ControllerManager:
                 candidate = pygame.joystick.Joystick(index)
                 candidate.init()
                 name = candidate.get_name() or f"Gamepad {index + 1}"
+                try:
+                    guid = candidate.get_guid()
+                except (AttributeError, pygame.error):
+                    guid = ""
             except pygame.error:
                 if candidate is not None:
                     try:
@@ -268,16 +397,20 @@ class ControllerManager:
                     except pygame.error:
                         pass
                 continue
+            candidates.append((index, candidate, name, guid))
 
-            if chosen is None:
-                chosen, chosen_name = candidate, name
-            elif any(token in name.lower() for token in preferred):
-                try:
-                    chosen.quit()
-                except pygame.error:
-                    pass
-                chosen, chosen_name = candidate, name
-                break
+        chosen = None
+        chosen_name = ""
+        best_score = -1
+        for index, candidate, name, guid in candidates:
+            score = self._candidate_score(candidate, name, guid, preferred)
+            if score > best_score:
+                if chosen is not None:
+                    try:
+                        chosen.quit()
+                    except pygame.error:
+                        pass
+                chosen, chosen_name, best_score = candidate, name, score
             else:
                 try:
                     candidate.quit()
@@ -287,8 +420,26 @@ class ControllerManager:
         if chosen is None:
             return
 
+        paths = _input_device_paths(chosen_name)
+        if (
+            not paths
+            and self._lost_name
+            and chosen_name == self._lost_name
+            and now < self._lost_until
+        ):
+            # SDL still exposes the device it just lost. Ignore it until the
+            # kernel node comes back instead of re-arming a dead controller.
+            try:
+                chosen.quit()
+            except pygame.error:
+                pass
+            return
+
         self._joy = chosen
         self._joy_name = chosen_name
+        self._device_paths = paths
+        self._missing_since = 0.0
+        self._last_probe = 0.0
         try:
             self._instance_id = chosen.get_instance_id()
         except (AttributeError, pygame.error):
@@ -304,7 +455,13 @@ class ControllerManager:
         except Exception:
             self._sdl_controller = None
             mapping = {}
-        self._mapping = effective_mapping(mapping)
+        self._set_mapping(effective_mapping(mapping))
+
+    def _set_mapping(self, mapping: dict[str, str]) -> None:
+        self._mapping = mapping
+        self._bindings = {
+            name: parse_binding(spec) for name, spec in mapping.items()
+        }
 
     def _disconnect(self) -> None:
         if self._joy is not None:
@@ -316,10 +473,67 @@ class ControllerManager:
         self._sdl_controller = None
         self._instance_id = None
         self._joy_name = ""
-        self._mapping = dict(DEFAULT_MAPPING)
+        self._device_paths = ()
+        self._missing_since = 0.0
+        with self._state_lock:
+            self._lost = False
+        self._set_mapping(dict(DEFAULT_MAPPING))
+
+    def _watch_loop(self) -> None:
+        """Stop the macro as soon as the kernel input nodes disappear.
+
+        This thread exists so a disconnect still stops output even if the Tk
+        main loop is busy or blocked inside a driver call.
+        """
+
+        while not self._watch_stop.wait(0.25):
+            with self._state_lock:
+                joy = self._joy
+                paths = self._device_paths
+                missing_since = self._missing_since
+            if joy is None:
+                self._missing_since = 0.0
+                continue
+            if paths and any(os.path.exists(path) for path in paths):
+                self._missing_since = 0.0
+                continue
+            if not paths:
+                # Non-Linux fallback (and devices SDL exposes without a
+                # matching kernel node): ask SDL, but never trust it while a
+                # known node is still present.
+                try:
+                    count = pygame.joystick.get_count() if pygame is not None else 1
+                except Exception:
+                    count = 1
+                if count > 0:
+                    self._missing_since = 0.0
+                    continue
+            now = time.monotonic()
+            if missing_since == 0.0:
+                self._missing_since = now
+                continue
+            if now - missing_since < 0.35:
+                continue
+            self._mark_lost()
+
+    def _mark_lost(self) -> None:
+        with self._state_lock:
+            if self._lost:
+                return
+            self._lost = True
+            self._lost_name = self._joy_name
+            self._lost_until = time.monotonic() + 3.0
+            self._last_scan = 0.0
+            callback = self._on_lost
+        self._missing_since = 0.0
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
 
     def _binding(self, semantic: str) -> Binding | None:
-        return parse_binding(self._mapping.get(semantic))
+        return self._bindings.get(semantic)
 
     def _button(self, semantic: str) -> bool:
         if self._joy is None:
@@ -337,6 +551,7 @@ class ControllerManager:
                 hat = self._joy.get_hat(binding.index)
                 return self._hat_has(hat, binding.mask)
         except (pygame.error, IndexError):
+            self._read_failed = True
             return False
         return False
 
@@ -357,6 +572,7 @@ class ControllerManager:
             if binding.kind == "h":
                 return 1.0 if self._hat_has(self._joy.get_hat(binding.index), binding.mask) else 0.0
         except (pygame.error, IndexError):
+            self._read_failed = True
             return fallback
         return fallback
 
@@ -375,6 +591,7 @@ class ControllerManager:
             if binding.kind == "b":
                 return 1.0 if self._joy.get_button(binding.index) else 0.0
         except (pygame.error, IndexError):
+            self._read_failed = True
             return 0.0
         return 0.0
 
@@ -396,6 +613,7 @@ class ControllerManager:
                     return value < -0.5
                 return value > 0.5
         except (pygame.error, IndexError):
+            self._read_failed = True
             return False
         return False
 
@@ -427,12 +645,47 @@ class ControllerManager:
             elif event.type == pygame.JOYDEVICEADDED:
                 self._last_scan = 0.0
 
+    def _probe_device(self) -> None:
+        """Catch Bluetooth/USB drops that SDL did not report as an event."""
+
+        if not self._ready or self._joy is None or pygame is None:
+            return
+        now = time.monotonic()
+        if now - self._last_probe < 0.5:
+            return
+        self._last_probe = now
+        try:
+            count = pygame.joystick.get_count()
+        except pygame.error:
+            self._read_failed = True
+            return
+        if count <= 0:
+            self._disconnect()
+
     def poll(self) -> PadState:
+        with self._state_lock:
+            lost = self._lost
+            self._lost = False
+        if lost:
+            self._disconnect()
+            self._last_connected = False
+            self._last_state = PadState(connected=False)
+            return self._last_state
+        try:
+            return self._poll()
+        except Exception as exc:  # a broken driver must never freeze the app
+            self._disconnect()
+            self._last_connected = False
+            self._last_state = PadState(connected=False, error=f"Controller error: {exc}")
+            return self._last_state
+
+    def _poll(self) -> PadState:
         if not self._ready:
             return PadState(connected=False, error=self._init_error)
 
         self._handle_events()
         self._scan()
+        self._probe_device()
         if self._joy is None:
             if self._last_connected:
                 self._last_connected = False
@@ -450,6 +703,7 @@ class ControllerManager:
             return self._last_state
 
         buttons = empty_buttons()
+        self._read_failed = False
         for semantic, control in _SEMANTIC_TO_CONTROL.items():
             buttons[control] = self._button(semantic)
         for semantic, control in _DPAD_TO_CONTROL.items():
@@ -469,6 +723,14 @@ class ControllerManager:
             "right_y": self._axis("righty"),
         }
 
+        if self._read_failed:
+            # The device vanished mid-read (common with Bluetooth).  Do not
+            # report a half-dead pad as connected or the macro will keep going.
+            self._disconnect()
+            self._last_connected = False
+            self._last_state = PadState(connected=False)
+            return self._last_state
+
         self._last_connected = True
         self._last_state = PadState(
             connected=True,
@@ -480,6 +742,10 @@ class ControllerManager:
         return self._last_state
 
     def shutdown(self) -> None:
+        self._watch_stop.set()
+        thread = self._watch_thread
+        if thread.is_alive():
+            thread.join(timeout=0.5)
         self._disconnect()
         if pygame is not None and self._ready:
             try:

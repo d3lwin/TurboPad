@@ -6,6 +6,10 @@ import sys
 
 
 def main() -> int:
+    if "--release-guard" in sys.argv:
+        from ps4_macro.guard import run_guardian
+
+        return run_guardian()
     try:
         from ps4_macro.ui import MacroApp
     except Exception as exc:  # pragma: no cover - startup diagnostics

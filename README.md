@@ -1,7 +1,5 @@
 # TurboPad
 
-*All the files in this project were 100% AI generated and I cannot guarantee full functionality of the program. Use at your own risk.*
-
 A cross-platform desktop **rapid-fire macro spammer** for a connected DualShock 4.
 TurboPad reads the controller live, lights up a full PS4 input map, and taps a
 keyboard key or mouse button while you hold (or toggle) an activation control.
@@ -43,15 +41,18 @@ artwork.
   face buttons, D-pad, L1/R1, analog L2/R2, sticks, stick clicks, Share,
   Options, and PS lit in real time.
 - **Turbo output** from **1 to 60 presses per second**, with accurate per-press
-  timing and automatic key release.
+  timing, a tunable **pulse width** (10–80 ms), and automatic key release.
 - **Target selector** for keyboard keys and mouse buttons, plus a
   **Capture** button for any key not in the list.
 - **Activation selector** for every PS4 control, including analog triggers
-  L2/R2.
+  L2/R2. Trigger edges are debounced with hysteresis so latched toggle mode
+  cannot flicker on/off.
 - **Hold or Toggle** activation mode.
-- **Panic stop** with the on-screen button or **F8** (global when available).
-- Safety behaviour: a controller disconnect or macro error releases the
-  simulated input immediately.
+- **Panic stop** with the on-screen button, **F8**, or the controller combo
+  **L1 + R1 + Options** (works even while a fullscreen game owns the keyboard).
+- Safety behaviour: a controller disconnect, Bluetooth drop, or macro error
+  stops the turbo and releases the simulated input immediately. A small
+  detached guard process sends a final key-up even if TurboPad is killed.
 - No console, game, or controller-specific driver required; it works alongside
   normal controller input.
 
@@ -86,9 +87,16 @@ run.bat                             # Windows
 5. Set **spam speed** between 1 and 60 Hz. 30 Hz and above is the turbo range.
    For games that sample input once per frame, 20–30 Hz is usually the most
    reliable; higher rates can be useful for event-driven games and macros.
-6. Choose **Hold** (fire only while held) or **Toggle** (tap once to start, tap
+6. Pick a **pulse width**. This is how long each simulated press is held.
+   The default is 30 ms. Older or frame-locked games (for example *Ys Origin*)
+   may miss very short taps: lower the speed to 10–20 Hz and raise the pulse
+   width to 50–80 ms. The line under the slider shows the press/cycle timing
+   that will actually be used.
+7. Choose **Hold** (fire only while held) or **Toggle** (tap once to start, tap
    again to stop).
-7. Press F8 or **STOP TURBO** at any time to stop immediately.
+8. Press F8, **STOP TURBO**, or hold **L1 + R1 + Options** at any time to stop
+   immediately. The controller combo is the reliable killswitch when a game is
+   fullscreen and has grabbed the keyboard.
 
 > The target is a keyboard/mouse action. Games that are configured to use the
 > corresponding key or mouse button will receive the rapid presses. TurboPad
@@ -128,8 +136,49 @@ on both.
 | "No controller detected" | Reconnect by USB, check `ls /dev/input/js*` on Linux, and verify the user is in the `input` group. |
 | Controller shows as a generic gamepad | That is fine — SDL's semantic game-controller mapping is used when available, with a DualShock 4 fallback. |
 | Output never reaches a game | Try windowed/borderless mode, run both apps with the same privileges, and check macOS Accessibility permissions. |
-| F8 only works while the window is focused | The global hotkey listener could not start (common on Wayland or without macOS permissions). The on-screen stop button still works. |
-| Stuck key after force-quitting | TurboPad releases inputs on a normal close and on errors. If a crash leaves a key down, tap it once manually. |
+| F8 only works while the window is focused | The global hotkey listener could not start (common on Wayland or without macOS permissions). Hold **L1 + R1 + Options** on the controller; that killswitch does not need keyboard focus. |
+| Older game ignores the rapid presses | Lower the spam speed to 10–20 Hz and raise **pulse width** to 50–80 ms so each press spans at least one game frame. Keep the game window focused and try borderless/windowed mode. |
+| Turbo keeps firing after the controller drops | It should stop automatically within about half a second: the app watches SDL removal events, `/dev/input` device nodes, read failures, and Bluetooth/USB drops. Press F8 or hold **L1 + R1 + Options** if a broken driver still reports stale input. |
+| Direction keeps scrolling after the game loses the controller | Fixed by the disconnect watchdog plus the detached release guard: even a hard kill of TurboPad now sends a final key-up. If an older build left a key down, tap the key once manually. |
+
+## Performance
+
+The turbo worker sleeps on an event while inactive, so it uses no measurable CPU
+between activations. The UI polls the controller at 50 Hz while input changes,
+drops to 25 Hz when a pad is connected but idle, and backs off to about 7 Hz
+when disconnected and 3 Hz when minimised. Widgets and the input map are only
+redrawn when their values actually change.
+
+## Linux AppImage
+
+The `packaging/` folder contains a reproducible AppImage build:
+
+```bash
+./packaging/build_appimage.sh
+```
+
+It creates a build virtualenv, freezes the app with PyInstaller (including the
+controller artwork), assembles an AppDir, and wraps it with `appimagetool`. The
+result is `TurboPad-x86_64.AppImage` in this folder; pass a path as the first
+argument to write it somewhere else. A prebuilt AppImage is included.
+
+The AppImage bundles Python, Tk, pygame, Pillow, and pynput, so the target
+machine does not need those installed. It requires glibc 2.38 or newer (for
+example Ubuntu 24.04+, Debian 13+, or Fedora 39+) and FUSE 2; on systems
+without FUSE run it with `--appimage-extract-and-run`.
+
+## Windows executable
+
+`TurboPad.exe` in this folder is a one-file PyInstaller build for 64-bit
+Windows 10/11. It bundles Python and all dependencies; no installer is needed.
+To build it yourself on Windows:
+
+```bat
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconfirm --clean --onefile --windowed --name TurboPad ^
+  --add-data "assets;assets" --hidden-import PIL._tkinter_finder ^
+  --collect-submodules pynput --collect-submodules pygame run.py
+```
 
 ## Project layout
 
@@ -141,6 +190,7 @@ ps4_macro/
   controller.py            pygame/SDL controller polling + normalised state
   spammer.py               Turbo timing thread and hold/toggle state machine
   output.py                pynput keyboard/mouse output
+  guard.py                 Detached process that releases keys after a crash
   targets.py               Target catalogue and key capture
   widgets.py               Custom slider, segmented control, cards
   theme.py                 Colours and visual tokens
@@ -149,10 +199,13 @@ assets/
   ds4_reference.svg        Original vector source (CC BY 3.0)
   NOTICE.txt               Artwork attribution
 tools/build_pad_asset.py   Rebuilds ds4_front.png from the SVG
+packaging/                 AppImage + icon build helpers
 tests/test_core.py         Spammer, target, and mapping tests
 tests/test_controller.py   Normalised controller-state tests
 tests/test_assets.py       Bundled artwork and attribution guards
 docs/screenshot.png        UI preview
+TurboPad-x86_64.AppImage   Prebuilt Linux AppImage
+TurboPad.exe               Prebuilt Windows executable
 ```
 
 ## Credits

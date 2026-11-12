@@ -4,7 +4,10 @@ import time
 import unittest
 
 from ps4_macro.controller import (
+    ALL_CONTROLS,
     DEFAULT_MAPPING,
+    TRIGGER_CONTROLS,
+    PadState,
     effective_mapping,
     parse_binding,
 )
@@ -17,19 +20,33 @@ class FakeOutput:
         self.available = True
         self.error = None
         self.events: list[tuple[str, str]] = []
+        self.timed: list[tuple[str, str, float]] = []
         self.held: set[str] = set()
+        self.emergency_calls = 0
 
     def press(self, target: TargetAction) -> None:
+        now = time.monotonic()
         self.events.append(("press", target.value))
+        self.timed.append(("press", target.value, now))
         self.held.add(target.value)
 
     def release(self, target: TargetAction) -> None:
+        now = time.monotonic()
         self.events.append(("release", target.value))
+        self.timed.append(("release", target.value, now))
         self.held.discard(target.value)
 
     def release_all(self) -> None:
         for value in list(self.held):
             self.events.append(("release", value))
+            self.timed.append(("release", value, time.monotonic()))
+        self.held.clear()
+
+    def emergency_release(self) -> None:
+        self.emergency_calls += 1
+        for value in list(self.held):
+            self.events.append(("emergency", value))
+            self.timed.append(("release", value, time.monotonic()))
         self.held.clear()
 
 
@@ -114,6 +131,126 @@ class SpammerTests(unittest.TestCase):
         self.spammer.activation_changed(True)
         self.assertFalse(self.spammer.active)
         self.spammer.activation_changed(False)
+
+    def test_toggle_panic_while_held_waits_for_release(self) -> None:
+        self.spammer.set_mode("toggle")
+        self.spammer.activation_changed(True)
+        self.assertTrue(self.spammer.active)
+
+        self.spammer.panic()
+        self.assertFalse(self.spammer.active)
+        # A duplicate held edge must not re-arm while the control is down.
+        self.spammer.activation_changed(True)
+        self.assertFalse(self.spammer.active)
+
+        self.spammer.activation_changed(False)
+        self.spammer.activation_changed(True)
+        self.assertTrue(self.spammer.active)
+
+    def test_controller_lost_stops_toggle_and_releases(self) -> None:
+        self.spammer.set_mode("toggle")
+        self.spammer.activation_changed(True)
+        self.assertTrue(wait_for(lambda: self.output.held))
+        self.spammer.controller_lost()
+        self.assertFalse(self.spammer.active)
+        self.assertFalse(self.output.held)
+        self.assertGreater(self.output.emergency_calls, 0)
+
+    def test_watchdog_stops_runaway_when_ui_stalls(self) -> None:
+        output = FakeOutput()
+        spammer = TurboSpammer(output, rate=20, mode="toggle", watchdog=0.25)
+        spammer.start()
+        try:
+            spammer.heartbeat()
+            spammer.activation_changed(True)
+            self.assertTrue(wait_for(lambda: output.held, 1.0))
+            # Stop calling heartbeat() to emulate a blocked/hung UI loop.
+            self.assertTrue(wait_for(lambda: not spammer.active, timeout=2.0))
+            self.assertFalse(output.held)
+            self.assertGreater(output.emergency_calls, 0)
+        finally:
+            spammer.shutdown()
+
+    def test_emergency_release_repeats_recent_targets(self) -> None:
+        from ps4_macro.output import OutputDriver
+
+        class Keyboard:
+            def __init__(self) -> None:
+                self.releases: list[str] = []
+
+            def press(self, _key: object) -> None:
+                pass
+
+            def release(self, _key: object) -> None:
+                self.releases.append("released")
+
+        driver = OutputDriver.__new__(OutputDriver)
+        driver._lock = __import__("threading").RLock()
+        driver._keyboard = Keyboard()
+        driver._mouse = object()
+        driver._held = {}
+        driver._recent = {}
+        driver._guard = None
+        driver.error = None
+        target = TargetAction("up", "Arrow Up", "key", "up")
+        driver.press(target)
+        driver.release(target)
+        self.assertEqual(driver._held, {})
+        driver.emergency_release()
+        # One normal key-up plus two emergency key-ups, even though the key was
+        # already released, so a lost event cannot leave it logically stuck.
+        self.assertEqual(driver._keyboard.releases, ["released"] * 3)
+
+    def test_every_activation_control_can_toggle(self) -> None:
+        for control in ALL_CONTROLS:
+            output = FakeOutput()
+            spammer = TurboSpammer(output, rate=20, mode="toggle")
+            spammer.start()
+            try:
+                state = PadState(connected=True)
+                state.buttons[control] = True
+                if control in TRIGGER_CONTROLS:
+                    state.triggers[control] = 1.0
+
+                pressed = state.control_pressed(control, False)
+                self.assertTrue(pressed, control)
+                spammer.activation_changed(pressed)
+                self.assertTrue(spammer.active, control)
+
+                state.buttons[control] = False
+                if control in TRIGGER_CONTROLS:
+                    state.triggers[control] = 0.0
+                released = state.control_pressed(control, True)
+                self.assertFalse(released, control)
+                spammer.activation_changed(released)
+                self.assertTrue(spammer.active, control)
+            finally:
+                spammer.shutdown()
+
+    def test_pulse_width_is_respected(self) -> None:
+        output = FakeOutput()
+        spammer = TurboSpammer(output, rate=10, mode="hold", pulse_ms=60)
+        spammer.start()
+        try:
+            spammer.activation_changed(True)
+            self.assertTrue(wait_for(lambda: len(output.timed) >= 6, timeout=1.5))
+            spammer.activation_changed(False)
+        finally:
+            spammer.shutdown()
+        time.sleep(0.05)
+
+        durations: list[float] = []
+        pressed_at: dict[str, float] = {}
+        for kind, value, stamp in output.timed:
+            if kind == "press":
+                pressed_at[value] = stamp
+            elif value in pressed_at:
+                durations.append(stamp - pressed_at.pop(value))
+
+        self.assertTrue(durations, "no completed pulses recorded")
+        for duration in durations:
+            self.assertGreaterEqual(duration, 0.045)
+            self.assertLessEqual(duration, 0.095)
 
     def test_panic_latches_until_release(self) -> None:
         self.spammer.set_mode("hold")

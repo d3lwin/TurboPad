@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TurboPad
+GenericName=DualShock 4 Macro Spammer
+Comment=Rapid-fire macro spammer for a DualShock 4 controller
+Exec=TurboPad
+Icon=turbopad
+Terminal=false
+Categories=Utility;Game;
+Keywords=controller;dualshock;ps4;macro;turbo;spam;

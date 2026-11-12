@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
+import time
 from dataclasses import dataclass
 
 from .targets import TargetAction
@@ -84,13 +88,95 @@ if Button is not None:
 class OutputDriver:
     """Serialises pynput calls and keeps track of currently held inputs."""
 
-    def __init__(self) -> None:
+    def __init__(self, start_guardian: bool = True) -> None:
         self._lock = threading.RLock()
         self._keyboard = None
         self._mouse = None
         self._held: dict[_Held, bool] = {}
+        # Everything pressed since launch. A panic re-releases these too, so a
+        # key-up lost during a focus change or driver hiccup cannot leave the
+        # game with a direction stuck down.
+        self._recent: dict[_Held, bool] = {}
+        self._guard: subprocess.Popen[str] | None = None
         self.error: str | None = None
         self._initialise()
+        if start_guardian and self.available:
+            self._spawn_guardian()
+
+    def _guardian_command(self) -> list[str] | None:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--release-guard"]
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env_path = os.environ.get("PYTHONPATH", "")
+        if root not in env_path.split(os.pathsep):
+            os.environ["PYTHONPATH"] = root + (os.pathsep + env_path if env_path else "")
+        return [sys.executable, "-m", "ps4_macro.guard"]
+
+    def _spawn_guardian(self) -> None:
+        if os.environ.get("TURBOPAD_NO_GUARD"):
+            return
+        command = self._guardian_command()
+        if command is None:
+            return
+        options: dict[str, object] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+            "bufsize": 1,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            self._guard = subprocess.Popen(command, **options)  # type: ignore[arg-type]
+        except Exception:
+            self._guard = None
+
+    def _guard_send(self, item: _Held) -> None:
+        guard = self._guard
+        if guard is None or guard.stdin is None:
+            return
+        try:
+            guard.stdin.write(f"P|{item.kind}|{item.value}\n")
+            guard.stdin.flush()
+        except Exception:
+            self._guard = None
+
+    def release_targets(self, targets, repeats: int = 2) -> None:
+        """Release explicit targets; used by the crash guard and tests."""
+
+        if not self.available:
+            return
+        with self._lock:
+            for target in targets:
+                item = _Held(target.kind, target.value)
+                for _ in range(max(1, repeats)):
+                    self._release_item(item)
+                self._held.pop(item, None)
+
+    def close(self) -> None:
+        """Release output and stop the crash guard cleanly."""
+
+        self.emergency_release()
+        guard = self._guard
+        self._guard = None
+        if guard is None:
+            return
+        try:
+            if guard.stdin is not None:
+                guard.stdin.write("Q\n")
+                guard.stdin.flush()
+                guard.stdin.close()
+        except Exception:
+            pass
+        try:
+            guard.wait(timeout=1.5)
+        except Exception:
+            try:
+                guard.terminate()
+            except Exception:
+                pass
 
     def _initialise(self) -> None:
         if _PYNPUT_IMPORT_ERROR is not None:
@@ -128,43 +214,58 @@ class OutputDriver:
                     self._mouse.press(button)
                 else:
                     self._keyboard.press(self._resolve_key(target.value))
-                self._held[_Held(target.kind, target.value)] = True
+                item = _Held(target.kind, target.value)
+                new_target = item not in self._recent
+                self._held[item] = True
+                self._recent[item] = True
+                if new_target:
+                    self._guard_send(item)
             except OutputError:
                 raise
             except Exception as exc:
                 raise OutputError(f"Could not press {target.label}: {exc}") from exc
 
+    def _release_item(self, item: _Held) -> None:
+        try:
+            if item.kind == "mouse":
+                button = _MOUSE_BUTTONS.get(item.value)
+                if button is not None:
+                    self._mouse.release(button)
+            else:
+                self._keyboard.release(self._resolve_key(item.value))
+        except Exception:
+            # A failed release must not mask the worker's primary error or
+            # prevent other held inputs from being cleaned up.
+            pass
+
     def release(self, target: TargetAction) -> None:
         if not self.available:
             return
         with self._lock:
-            try:
-                if target.kind == "mouse":
-                    button = _MOUSE_BUTTONS.get(target.value)
-                    if button is not None:
-                        self._mouse.release(button)
-                else:
-                    self._keyboard.release(self._resolve_key(target.value))
-            except Exception:
-                # A failed release must not mask the worker's primary error or
-                # prevent other held inputs from being cleaned up.
-                pass
-            finally:
-                self._held.pop(_Held(target.kind, target.value), None)
+            self._release_item(_Held(target.kind, target.value))
+            self._held.pop(_Held(target.kind, target.value), None)
 
     def release_all(self) -> None:
         if not self.available:
             return
         with self._lock:
-            held = list(self._held)
-            for item in held:
-                try:
-                    if item.kind == "mouse":
-                        button = _MOUSE_BUTTONS.get(item.value)
-                        if button is not None:
-                            self._mouse.release(button)
-                    else:
-                        self._keyboard.release(self._resolve_key(item.value))
-                except Exception:
-                    pass
+            for item in list(self._held):
+                self._release_item(item)
                 self._held.pop(item, None)
+
+    def emergency_release(self) -> None:
+        """Release held inputs and re-send every key-up touched this session.
+
+        Repeating the release is deliberate: games running under Wine or with a
+        keyboard grab occasionally miss a single synthetic key-up, which then
+        looks like an endless direction drift in a menu.
+        """
+
+        if not self.available:
+            return
+        with self._lock:
+            for item in list(self._recent):
+                for _ in range(5):
+                    self._release_item(item)
+                    time.sleep(0.01)
+            self._held.clear()

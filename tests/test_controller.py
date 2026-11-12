@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from ps4_macro.controller import ControllerManager, effective_mapping
+from ps4_macro.controller import ControllerManager, PadState, effective_mapping
 
 
 class FakeJoystick:
@@ -24,7 +24,7 @@ class FakeJoystick:
 def manager_with(fake: FakeJoystick, mapping: dict[str, str] | None = None) -> ControllerManager:
     manager = ControllerManager.__new__(ControllerManager)
     manager._joy = fake
-    manager._mapping = effective_mapping(mapping)
+    manager._set_mapping(effective_mapping(mapping))
     return manager
 
 
@@ -51,6 +51,24 @@ class ControllerReadTests(unittest.TestCase):
         self.assertFalse(manager._digital("dpdown"))
         self.assertTrue(manager._digital("dpleft"))
         self.assertFalse(manager._digital("dpright"))
+
+
+class PadStateTests(unittest.TestCase):
+    def test_trigger_hysteresis_prevents_chatter(self) -> None:
+        state = PadState(connected=True)
+        state.triggers["r2"] = 0.30
+        self.assertFalse(state.control_pressed("r2", False))
+        state.triggers["r2"] = 0.40
+        self.assertTrue(state.control_pressed("r2", False))
+        state.triggers["r2"] = 0.25  # below the press threshold but above release
+        self.assertTrue(state.control_pressed("r2", True))
+        state.triggers["r2"] = 0.15
+        self.assertFalse(state.control_pressed("r2", True))
+
+    def test_disconnected_pad_never_presses(self) -> None:
+        state = PadState(connected=False)
+        state.buttons["cross"] = True
+        self.assertFalse(state.control_pressed("cross", False))
 
 
 if __name__ == "__main__":

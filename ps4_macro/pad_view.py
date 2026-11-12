@@ -423,7 +423,7 @@ class PadCanvas(tk.Canvas):
         }
 
     # ------------------------------------------------------------------- updates
-    def set_state(self, state: PadState, spam_active: bool = False) -> None:
+    def set_state(self, state: PadState, spam_active: bool = False) -> bool:
         signature = (
             state.connected,
             state.error,
@@ -433,11 +433,12 @@ class PadCanvas(tk.Canvas):
             tuple(round(state.axes.get(name, 0.0), 2) for name in sorted(state.axes)),
         )
         if signature == self._signature:
-            return
+            return False
         self._signature = signature
         self._state = state
         self._spam_active = spam_active
         self._apply_state(state, spam_active=spam_active)
+        return True
 
     def _apply_state(self, state: PadState, spam_active: bool = False) -> None:
         connected = state.connected

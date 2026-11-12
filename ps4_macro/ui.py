@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import signal
 import threading
 import time
 import tkinter as tk
@@ -17,7 +19,7 @@ from .controller import (
 )
 from .output import OutputDriver
 from .pad_view import PadCanvas
-from .spammer import MAX_RATE, MIN_RATE, TurboSpammer
+from .spammer import DEFAULT_PULSE_MS, MAX_RATE, MIN_RATE, TurboSpammer
 from .targets import (
     BUILTIN_TARGETS,
     DEFAULT_TARGET,
@@ -97,20 +99,29 @@ class MacroApp(tk.Tk):
         self._configure_styles()
 
         self.output = OutputDriver()
-        self.controller = ControllerManager()
         self.target: TargetAction = DEFAULT_TARGET
         self.activation_id = "r2"
         self.rate = 20
+        self.pulse_ms = DEFAULT_PULSE_MS
         self.mode = "hold"
         self.targets: list[TargetAction] = list(BUILTIN_TARGETS)
         self._activation_down = False
+        self._pad_was_connected = False
+        self._last_pad_change = 0.0
         self._previous_active: set[str] = set()
         self._last_input_at = 0.0
         self._last_connection: tuple[bool, str, str] | None = None
         self._last_engine_text = ""
+        self._last_engine_color = ""
+        self._last_dot_color = ""
+        self._last_badge_text = ""
+        self._last_detail = ""
+        self._last_detail_color = ""
+        self._last_count_text = ""
+        self._last_input_text = ""
+        self._last_input_color = ""
         self._last_footer = ""
         self._last_footer_color = ""
-        self._last_count = -1
         self._toast_until = 0.0
         self._toast_text = ""
         self._toast_color = theme.MUTED
@@ -120,14 +131,22 @@ class MacroApp(tk.Tk):
         self._hotkey_listener = None
         self._hotkey_ready = False
         self._tick_after: str | None = None
+        self._combo_since: float | None = None
+        self._combo_fired = False
 
         self.spammer = TurboSpammer(
             self.output,
             target=self.target,
             rate=self.rate,
             mode=self.mode,  # type: ignore[arg-type]
+            pulse_ms=self.pulse_ms,
+            watchdog=1.5,
         )
+        self.controller = ControllerManager(on_lost=self._on_controller_lost)
         self.spammer.start()
+
+        atexit.register(self._release_on_exit)
+        self._install_signal_handlers()
 
         self._build_ui()
         self._bind_events()
@@ -183,7 +202,7 @@ class MacroApp(tk.Tk):
         self._build_header(header)
 
         main = tk.Frame(self, bg=theme.BG)
-        main.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        main.pack(fill="both", expand=True, padx=16, pady=(0, 6))
         main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=1)
         main.grid_columnconfigure(1, weight=0, minsize=366)
@@ -194,7 +213,7 @@ class MacroApp(tk.Tk):
         self._build_side_panel(right)
 
         footer = tk.Frame(self, bg=theme.BG)
-        footer.pack(fill="x", padx=20, pady=(0, 11))
+        footer.pack(fill="x", padx=20, pady=(0, 9))
         self._build_footer(footer)
 
     def _build_header(self, parent: tk.Frame) -> None:
@@ -366,15 +385,15 @@ class MacroApp(tk.Tk):
         return card
 
     def _build_side_panel(self, parent: tk.Frame) -> None:
-        self.status_card = Card(parent, padding=13)
+        self.status_card = Card(parent, padding=11)
         self.status_card.pack(fill="x")
         self._build_status_card(self.status_card.body)
 
-        self.settings_card = Card(parent, padding=14)
-        self.settings_card.pack(fill="x", pady=10)
+        self.settings_card = Card(parent, padding=9)
+        self.settings_card.pack(fill="x", pady=8)
         self._build_settings_card(self.settings_card.body)
 
-        self.safety_card = Card(parent, padding=12)
+        self.safety_card = Card(parent, padding=10)
         self.safety_card.pack(fill="x", side="bottom")
         self._build_safety_card(self.safety_card.body)
 
@@ -497,7 +516,7 @@ class MacroApp(tk.Tk):
         )
         self.test_button.grid(row=0, column=2, padx=(5, 0), sticky="ns")
 
-        self._field_label(parent, "ACTIVATION BUTTON", "Hold or tap this controller control", top=12)
+        self._field_label(parent, "ACTIVATION BUTTON", "Hold or tap this controller control", top=9)
         self.activation_var = tk.StringVar(value=CONTROL_LABELS[self.activation_id])
         self.activation_combo = ttk.Combobox(
             parent,
@@ -512,7 +531,7 @@ class MacroApp(tk.Tk):
         self.activation_combo.bind("<<ComboboxSelected>>", self._on_activation_selected)
 
         speed_head = tk.Frame(parent, bg=theme.CARD)
-        speed_head.pack(fill="x", pady=(12, 0))
+        speed_head.pack(fill="x", pady=(9, 0))
         tk.Label(
             speed_head,
             text="SPAM SPEED",
@@ -566,7 +585,7 @@ class MacroApp(tk.Tk):
 
         self.preset_buttons: dict[int, tk.Button] = {}
         preset_row = tk.Frame(parent, bg=theme.CARD)
-        preset_row.pack(fill="x", pady=(6, 0))
+        preset_row.pack(fill="x", pady=(4, 0))
         for column, preset in enumerate((5, 10, 20, 30, 45, 60)):
             preset_row.grid_columnconfigure(column, weight=1)
             button = flat_button(
@@ -584,8 +603,34 @@ class MacroApp(tk.Tk):
             button.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 2, 0))
             self.preset_buttons[preset] = button
 
+        pulse_row = tk.Frame(parent, bg=theme.CARD)
+        pulse_row.pack(fill="x", pady=(5, 0))
+        tk.Label(
+            pulse_row,
+            text="PULSE WIDTH",
+            bg=theme.CARD,
+            fg=theme.MUTED,
+            font=self.fonts.micro_bold,
+        ).pack(side="left")
+        self.pulse_buttons: dict[int, tk.Button] = {}
+        for value in reversed((10, 20, 30, 50, 80)):
+            button = flat_button(
+                pulse_row,
+                text=f"{value}",
+                command=lambda pulse=value: self._apply_pulse(pulse),
+                font=self.fonts.micro_bold,
+                background=theme.INPUT,
+                foreground=theme.MUTED,
+                active_background=theme.ACCENT_DARK,
+                active_foreground=theme.ACCENT,
+                padx=6,
+                pady=2,
+            )
+            button.pack(side="right", padx=(2, 0))
+            self.pulse_buttons[value] = button
+
         mode_row = tk.Frame(parent, bg=theme.CARD)
-        mode_row.pack(fill="x", pady=(12, 0))
+        mode_row.pack(fill="x", pady=(8, 0))
         tk.Label(
             mode_row,
             text="ACTIVATION MODE",
@@ -601,7 +646,7 @@ class MacroApp(tk.Tk):
             font=self.fonts.tiny_bold,
             background=theme.CARD,
         )
-        self.mode_control.pack(fill="x", pady=(4, 0))
+        self.mode_control.pack(fill="x", pady=(3, 0))
         self.mode_hint = tk.Label(
             parent,
             text="Hold R2 to fire",
@@ -610,7 +655,7 @@ class MacroApp(tk.Tk):
             font=self.fonts.micro,
             anchor="w",
         )
-        self.mode_hint.pack(fill="x", pady=(4, 0))
+        self.mode_hint.pack(fill="x", pady=(2, 0))
 
     def _build_safety_card(self, parent: tk.Frame) -> None:
         self.stop_button = flat_button(
@@ -628,7 +673,7 @@ class MacroApp(tk.Tk):
         self.stop_button.pack(fill="x")
         self.hotkey_hint = tk.Label(
             parent,
-            text="F8 global panic key",
+            text="F8 \u00b7 L1+R1+Options \u00b7 works in-game",
             bg=theme.CARD,
             fg=theme.MUTED,
             font=self.fonts.micro,
@@ -704,7 +749,7 @@ class MacroApp(tk.Tk):
 
     def _install_hotkey(self) -> None:
         if GlobalHotKeys is None:
-            self.hotkey_hint.configure(text="F8 panic stop (app focused)")
+            self.hotkey_hint.configure(text="F8 (focused) \u00b7 L1+R1+Options in-game")
             return
         try:
             self._hotkey_listener = GlobalHotKeys({"<f8>": self._request_panic})
@@ -713,9 +758,45 @@ class MacroApp(tk.Tk):
         except Exception:
             self._hotkey_listener = None
             self._hotkey_ready = False
-            self.hotkey_hint.configure(text="F8 panic stop (app focused)")
+            self.hotkey_hint.configure(text="F8 (focused) \u00b7 L1+R1+Options in-game")
+
+    def _install_signal_handlers(self) -> None:
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                signal.signal(signum, self._on_signal)
+            except (ValueError, OSError):
+                pass
+
+    def _on_signal(self, _signum: int, _frame: object) -> None:
+        # Release output from the signal handler itself: the Tk loop may be
+        # blocked, but a stuck key must not survive Ctrl+C or a terminal close.
+        self.spammer.panic()
+        try:
+            self.after(0, self._on_close)
+        except Exception:
+            pass
+
+    def _release_on_exit(self) -> None:
+        try:
+            self.output.close()
+        except Exception:
+            pass
+
+    def _on_controller_lost(self) -> None:
+        """Called from the controller watchdog thread."""
+
+        # This must not touch Tk. The output is released here so a hung main
+        # loop cannot keep the last key pressed.
+        self._activation_down = False
+        self.spammer.controller_lost()
 
     def _request_panic(self) -> None:
+        # Release on the hotkey listener's thread as well; the UI tick may be
+        # stalled (or the game may hold the keyboard focus).
+        self.spammer.panic()
         self._panic_request.set()
 
     def _on_f8(self, _event: tk.Event) -> str:
@@ -822,14 +903,20 @@ class MacroApp(tk.Tk):
     def _update_rate_labels(self) -> None:
         self.rate_label.configure(text=f"{self.rate} Hz")
         interval_ms = 1000.0 / max(1, self.rate)
-        if interval_ms >= 10:
-            interval_text = f"{interval_ms:.0f} ms / press"
-        else:
-            interval_text = f"{interval_ms:.1f} ms / press"
-        self.interval_label.configure(text=interval_text)
+        press_ms = TurboSpammer.effective_pulse_ms(self.rate, self.pulse_ms)
+        self.interval_label.configure(
+            text=f"{press_ms:.0f} ms press \u00b7 {interval_ms:.0f} ms cycle"
+        )
         if hasattr(self, "preset_buttons"):
             for value, button in self.preset_buttons.items():
                 active = value == self.rate
+                button.configure(
+                    bg=theme.ACCENT_DARK if active else theme.INPUT,
+                    fg=theme.ACCENT if active else theme.MUTED,
+                )
+        if hasattr(self, "pulse_buttons"):
+            for value, button in self.pulse_buttons.items():
+                active = value == self.pulse_ms
                 button.configure(
                     bg=theme.ACCENT_DARK if active else theme.INPUT,
                     fg=theme.ACCENT if active else theme.MUTED,
@@ -841,6 +928,13 @@ class MacroApp(tk.Tk):
         self.spammer.set_rate(self.rate)
         self._update_rate_labels()
         self._sync_engine(force=True)
+
+    def _apply_pulse(self, value: int) -> None:
+        self.pulse_ms = int(value)
+        self.spammer.set_pulse_ms(self.pulse_ms)
+        self._update_rate_labels()
+        self._sync_engine(force=True)
+        self._toast(f"Pulse width: {self.pulse_ms} ms", theme.ACCENT, 2.0)
 
     def _test_target(self) -> None:
         if not self.output.available:
@@ -896,21 +990,73 @@ class MacroApp(tk.Tk):
     def _tick(self) -> None:
         if self._closing:
             return
+        delay = 20
+        self.spammer.heartbeat()
         try:
             if self._panic_request.is_set():
                 self._panic_request.clear()
                 self.panic_stop()
 
             state = self.controller.poll()
-            self.pad_view.set_state(state, spam_active=self.spammer.active)
+            self._handle_connection_loss(state)
+            self._check_panic_combo(state)
+            changed = self.pad_view.set_state(state, spam_active=self.spammer.active)
+            if changed:
+                self._last_pad_change = time.monotonic()
             self._update_connection(state)
             self._handle_activation(state)
             self._detect_last_input(state)
             self._sync_engine()
             self._refresh_footer(state)
+
+            # A disconnected or idle app has nothing to animate: poll slowly to
+            # keep idle CPU usage near zero, but snap back once input changes.
+            if not state.connected:
+                delay = 150
+            elif time.monotonic() - self._last_pad_change > 0.8:
+                delay = 40
+            if self.state() == "iconic":
+                delay = max(delay, 300)
+        except Exception as exc:  # never let a driver/UI error leave keys down
+            print(f"TurboPad tick error: {exc}", flush=True)
+            try:
+                self.spammer.controller_lost()
+            except Exception:
+                pass
+            self._toast("Internal error \u00b7 turbo stopped", theme.RED, 4.0)
         finally:
+            self.spammer.heartbeat()
             if not self._closing:
-                self._tick_after = self.after(16, self._tick)
+                self._tick_after = self.after(delay, self._tick)
+
+    def _check_panic_combo(self, state: PadState) -> None:
+        """Controller-only killswitch that works while the game has focus."""
+
+        pressed = (
+            state.connected
+            and state.buttons.get("l1", False)
+            and state.buttons.get("r1", False)
+            and state.buttons.get("options", False)
+        )
+        if not pressed:
+            self._combo_since = None
+            self._combo_fired = False
+            return
+        now = time.monotonic()
+        if self._combo_since is None:
+            self._combo_since = now
+            return
+        if not self._combo_fired and now - self._combo_since >= 0.6:
+            self._combo_fired = True
+            self.spammer.panic()
+            self._toast("PANIC \u00b7 L1 + R1 + Options", theme.RED, 4.0)
+
+    def _handle_connection_loss(self, state: PadState) -> None:
+        if self._pad_was_connected and not state.connected:
+            self._activation_down = False
+            self.spammer.controller_lost()
+            self._toast("Controller disconnected \u00b7 turbo stopped", theme.AMBER, 4.0)
+        self._pad_was_connected = state.connected
 
     def _update_connection(self, state: PadState) -> None:
         signature = (state.connected, state.name, state.error)
@@ -939,11 +1085,11 @@ class MacroApp(tk.Tk):
 
     def _handle_activation(self, state: PadState) -> None:
         if not state.connected:
-            if self._activation_down or self.spammer.active:
+            if self._activation_down:
                 self._activation_down = False
                 self.spammer.reset_activation()
             return
-        pressed = state.control_active(self.activation_id, threshold=0.35)
+        pressed = state.control_pressed(self.activation_id, self._activation_down)
         if pressed == self._activation_down:
             return
         self._activation_down = pressed
@@ -955,13 +1101,14 @@ class MacroApp(tk.Tk):
                 self._toast("Turbo latched OFF", theme.MUTED, 2.0)
 
     def _detect_last_input(self, state: PadState) -> None:
+        if not state.connected:
+            self._previous_active = set()
+            self._last_input_at = 0.0
+            self._set_last_input("\u2014", theme.TEXT_SOFT)
+            return
         active = state.active_controls(threshold=0.22)
         new_inputs = active - self._previous_active
         self._previous_active = active
-        if not state.connected:
-            if self.last_input_label.cget("text") != "\u2014":
-                self.last_input_label.configure(text="\u2014", fg=theme.TEXT_SOFT)
-            return
         if new_inputs:
             order = (
                 "cross",
@@ -987,13 +1134,18 @@ class MacroApp(tk.Tk):
                 label = CONTROL_LABELS[chosen]
                 if chosen in ("l2", "r2"):
                     label = f"{label}  {state.triggers.get(chosen, 0.0) * 100:.0f}%"
-                self.last_input_label.configure(text=label, fg=theme.ACCENT)
+                self._set_last_input(label, theme.ACCENT)
                 self._last_input_at = time.monotonic()
+        elif self._last_input_at and time.monotonic() - self._last_input_at > 1.8:
+            if self._last_input_text != "\u2014" and self._last_input_color != theme.TEXT_SOFT:
+                self._set_last_input(self._last_input_text, theme.TEXT_SOFT)
 
-        if self._last_input_at and time.monotonic() - self._last_input_at > 1.8:
-            current = self.last_input_label.cget("text")
-            if current != "\u2014" and self.last_input_label.cget("fg") != theme.TEXT_SOFT:
-                self.last_input_label.configure(fg=theme.TEXT_SOFT)
+    def _set_last_input(self, text: str, color: str) -> None:
+        if text == self._last_input_text and color == self._last_input_color:
+            return
+        self._last_input_text = text
+        self._last_input_color = color
+        self.last_input_label.configure(text=text, fg=color)
 
     def _sync_engine(self, force: bool = False) -> None:
         snapshot = self.spammer.snapshot()
@@ -1011,32 +1163,49 @@ class MacroApp(tk.Tk):
 
         pulse_off = snapshot.active and int(time.monotonic() * 5) % 2 == 0
         dot_color = theme.ACCENT_MID if pulse_off else state_color
-        self.state_dot.itemconfigure(self.state_dot_item, fill=dot_color)
+        if force or dot_color != self._last_dot_color:
+            self._last_dot_color = dot_color
+            self.state_dot.itemconfigure(self.state_dot_item, fill=dot_color)
 
-        if force or state_text != self._last_engine_text:
+        if (
+            force
+            or state_text != self._last_engine_text
+            or state_color != self._last_engine_color
+        ):
             self._last_engine_text = state_text
+            self._last_engine_color = state_color
             self.state_label.configure(text=state_text, fg=state_color)
 
-        if force or snapshot.presses != self._last_count:
-            self._last_count = snapshot.presses
-            self.count_label.configure(text=f"{snapshot.presses:,}")
+        count_text = f"{snapshot.presses:,}"
+        if force or count_text != self._last_count_text:
+            self._last_count_text = count_text
+            self.count_label.configure(text=count_text)
 
         activation_label = CONTROL_LABELS[self.activation_id]
         if snapshot.error:
             detail = snapshot.error
+            detail_color = theme.RED
         elif snapshot.active:
             detail = f"Spamming {self.target.label} at {self.rate} Hz"
+            detail_color = theme.MUTED
         elif self.mode == "hold":
             detail = f"Hold {activation_label} to fire \u00b7 {self.target.label}"
+            detail_color = theme.MUTED
         else:
             detail = f"Tap {activation_label} to toggle \u00b7 {self.target.label}"
-        if force or self.engine_detail.cget("text") != detail:
-            self.engine_detail.configure(text=detail, fg=theme.RED if snapshot.error else theme.MUTED)
+            detail_color = theme.MUTED
+        if force or detail != self._last_detail or detail_color != self._last_detail_color:
+            self._last_detail = detail
+            self._last_detail_color = detail_color
+            self.engine_detail.configure(text=detail, fg=detail_color)
 
-        if self.output.available:
-            self.output_badge.configure(text="OUTPUT READY", fg=theme.ACCENT)
-        else:
-            self.output_badge.configure(text="OUTPUT OFFLINE", fg=theme.RED)
+        badge = "OUTPUT READY" if self.output.available else "OUTPUT OFFLINE"
+        if force or badge != self._last_badge_text:
+            self._last_badge_text = badge
+            self.output_badge.configure(
+                text=badge,
+                fg=theme.ACCENT if self.output.available else theme.RED,
+            )
 
     def _refresh_footer(self, state: PadState) -> None:
         now = time.monotonic()
@@ -1086,5 +1255,6 @@ class MacroApp(tk.Tk):
                     self._hotkey_listener.stop()
                 except Exception:
                     pass
+            self.output.close()
             self.controller.shutdown()
             self.destroy()
