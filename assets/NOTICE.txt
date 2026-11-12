@@ -1,0 +1,17 @@
+TurboPad controller artwork
+===========================
+
+`assets/ds4_front.png` is derived from:
+
+  Dualshock 4 Layout.svg
+  https://commons.wikimedia.org/wiki/File:Dualshock_4_Layout.svg
+
+  Author: Tokyoship
+  License: Creative Commons Attribution 3.0 Unported (CC BY 3.0)
+  https://creativecommons.org/licenses/by/3.0/
+
+The original vector artwork was recoloured for TurboPad's dark interface and
+rasterised with `tools/build_pad_asset.py`. No other changes were made to the
+shape or layout of the controller.
+
+The unmodified source is kept in `assets/ds4_reference.svg` for rebuilds.
